@@ -1,0 +1,10 @@
+google-adk==1.28.0
+google-cloud-logging
+google-cloud-bigquery
+google-cloud-alloydb-connector[pg8000]
+pg8000
+sqlalchemy
+feedparser
+requests
+python-dotenv
+google-auth
