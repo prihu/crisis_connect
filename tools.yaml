@@ -1,0 +1,16 @@
+sources:
+  crisis-bq:
+    kind: bigquery
+    project: crisis-connect-hackathon
+
+tools:
+  test_query:
+    kind: bigquery-sql
+    source: crisis-bq
+    description: "Test query to verify BigQuery connection"
+    statement: |
+      SELECT COUNT(*) as total FROM `crisis-connect-hackathon.crisis_connect.disaster_alerts`
+
+toolsets:
+  crisis_connect:
+    - test_query
