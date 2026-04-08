@@ -1,5 +1,6 @@
+__pycache__/
+.adk/
+.env
+*.pyc
 toolbox
-.env
 .DS_Store
-.env
-.env

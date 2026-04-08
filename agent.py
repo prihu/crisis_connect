@@ -21,23 +21,15 @@ from google.adk.tools.tool_context import ToolContext
 from . import tools
 from . import alloydb_tools
 
-import logging
-import asyncio
-
-# Force the ADK to print the actual sub-exception instead of swallowing it
-logging.getLogger("google.adk").setLevel(logging.DEBUG)
-asyncio.get_event_loop().set_debug(True)
-
 # --- Setup ---
 load_dotenv()
 model_name = os.getenv("MODEL", "gemini-2.5-flash")
 project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "crisis-connect-hackathon")
 
-# --- Track 2: BigQuery MCP or direct API ---
-# MCP toolset is available via tools.get_bigquery_mcp_toolset() using
-# McpToolset + StreamableHTTPConnectionParams (see tools.py).
-# For demo reliability, we use direct API by default since MCP OAuth tokens
-# expire after ~60 min. Set USE_BQ_MCP=1 in .env to enable MCP mode.
+# --- Track 2: BigQuery via MCP Toolbox for Databases ---
+# MCP Toolbox (github.com/googleapis/genai-toolbox) runs as a sidecar on port 5000.
+# Handles auth via ADC, connection pooling, no OAuth token management needed.
+# Set USE_BQ_MCP=0 to disable MCP and use direct BigQuery API instead.
 use_bq_mcp = os.getenv("USE_BQ_MCP", "1") == "1"
 bigquery_mcp = None
 if use_bq_mcp:
@@ -100,10 +92,12 @@ def fetch_gdacs_alerts(tool_context: ToolContext) -> dict:
         all_entries = []
         for feed_url in _GDACS_FEEDS:
             try:
-                parsed = feedparser.parse(feed_url)
+                import requests as _req
+                resp = _req.get(feed_url, timeout=5)
+                parsed = feedparser.parse(resp.content)
                 all_entries.extend(parsed.entries)
-            except Exception:
-                pass
+            except Exception as ex:
+                logging.warning(f"[GDACS] Failed to fetch {feed_url}: {ex}")
         # Deduplicate by link
         seen = set()
         unique = []
@@ -146,6 +140,7 @@ def fetch_gdacs_alerts(tool_context: ToolContext) -> dict:
                 search_terms.append(country)
 
     alerts = []
+    all_alerts = []
     for entry in feed.entries[:30]:
         alert = {
             "title": entry.get("title", ""),
@@ -154,11 +149,18 @@ def fetch_gdacs_alerts(tool_context: ToolContext) -> dict:
             "link": entry.get("link", ""),
         }
         text_content = (alert["title"] + " " + alert["summary"]).lower()
+        all_alerts.append(alert)
 
         if not search_terms:
             alerts.append(alert)  # No filter, return all
         elif any(term in text_content for term in search_terms):
             alerts.append(alert)
+
+    # Fallback: if no location-specific alerts, return top global alerts
+    # so the agent always has live GDACS data to present
+    if not alerts and all_alerts:
+        alerts = all_alerts[:3]
+        logging.info(f"[GDACS] No local alerts found, returning top {len(alerts)} global alerts as context")
 
     top_alerts = alerts[:5]
     tool_context.state["gdacs_alerts"] = top_alerts
@@ -175,23 +177,39 @@ def fetch_gdacs_alerts(tool_context: ToolContext) -> dict:
 if use_bq_mcp:
     _sa_tools = [fetch_gdacs_alerts, bigquery_mcp, tools.query_bigquery]
     _sa_bq_instruction = (
-        "2. PREFERRED: Use BigQuery MCP tools (execute_sql_readonly, get_table_info, list_table_ids) to query project "
-        + project_id + ", dataset crisis_connect.\n"
-        "   BACKUP: If MCP tools fail or error, use query_bigquery instead with full SQL.\n"
-        '   Example query: "SELECT event_type, severity, description, affected_population, status '
-        "FROM `" + project_id + ".crisis_connect.disaster_alerts` "
-        "WHERE LOWER(country) LIKE LOWER('%' || '{user_location}' || '%') ORDER BY event_date DESC LIMIT 5\"\n"
-        "   Also query: community_demographics (population, hospitals, shelter_capacity) and historical_disasters (lessons learned)."
+        "2. Query BigQuery for crisis data (project: " + project_id + ", dataset: crisis_connect).\n"
+        "   STRATEGY: Try MCP tool execute_sql FIRST. If it returns ANY error, timeout, empty result,\n"
+        "   or takes too long — IMMEDIATELY switch to query_bigquery with the same SQL. Do NOT retry MCP.\n"
+        "   Once you switch to query_bigquery, use it for ALL remaining queries in this session.\n"
+        "   Available MCP tools: execute_sql, get_table_info, list_table_ids, list_dataset_ids\n"
+        "   Fallback tool: query_bigquery (direct BigQuery API, always works)\n"
+        "   IMPORTANT SCHEMA NOTES:\n"
+        "   - Tables have BOTH 'country' (e.g. 'Philippines') AND 'region' (e.g. 'Manila', 'Luzon') columns.\n"
+        "   - When user says a city like 'Quezon City, Manila', extract COUNTRY='Philippines' and CITY='Manila'.\n"
+        "   - Replace COUNTRY and CITY in the SQL below with the actual values you extract.\n"
+        "   Run these 3 queries:\n"
+        "   Q1 (alerts): SELECT event_type, severity, description, affected_population, status FROM `" + project_id + ".crisis_connect.disaster_alerts` "
+        "WHERE LOWER(country) = LOWER('COUNTRY') OR LOWER(region) LIKE LOWER('%CITY%') ORDER BY event_date DESC LIMIT 5\n"
+        "   Q2 (demographics): SELECT region, population, hospital_count, shelter_capacity, flood_risk_zone FROM `" + project_id + ".crisis_connect.community_demographics` "
+        "WHERE LOWER(country) = LOWER('COUNTRY') OR LOWER(region) LIKE LOWER('%CITY%') LIMIT 5\n"
+        "   Q3 (history): SELECT event_type, year, magnitude_or_category, fatalities, lessons_learned FROM `" + project_id + ".crisis_connect.historical_disasters` "
+        "WHERE LOWER(country) = LOWER('COUNTRY') ORDER BY year DESC LIMIT 5"
     )
 else:
     _sa_tools = [fetch_gdacs_alerts, tools.query_bigquery]
     _sa_bq_instruction = (
-        "2. Use query_bigquery to run SQL. Example queries:\n"
-        "   SELECT event_type, severity, description, affected_population, status\n"
-        "   FROM `" + project_id + ".crisis_connect.disaster_alerts`\n"
-        "   WHERE LOWER(country) LIKE LOWER('%' || '{user_location}' || '%')\n"
-        "   ORDER BY event_date DESC LIMIT 5\n"
-        "   Also query: community_demographics and historical_disasters tables."
+        "2. Use query_bigquery to run SQL against project " + project_id + ", dataset crisis_connect.\n"
+        "   IMPORTANT SCHEMA NOTES:\n"
+        "   - Tables have BOTH 'country' (e.g. 'Philippines') AND 'region' (e.g. 'Manila', 'Luzon') columns.\n"
+        "   - When user says a city like 'Quezon City, Manila', extract COUNTRY='Philippines' and CITY='Manila'.\n"
+        "   - Replace COUNTRY and CITY in the SQL below with the actual values you extract.\n"
+        "   Run these 3 queries:\n"
+        "   Q1 (alerts): SELECT event_type, severity, description, affected_population, status FROM `" + project_id + ".crisis_connect.disaster_alerts` "
+        "WHERE LOWER(country) = LOWER('COUNTRY') OR LOWER(region) LIKE LOWER('%CITY%') ORDER BY event_date DESC LIMIT 5\n"
+        "   Q2 (demographics): SELECT region, population, hospital_count, shelter_capacity, flood_risk_zone FROM `" + project_id + ".crisis_connect.community_demographics` "
+        "WHERE LOWER(country) = LOWER('COUNTRY') OR LOWER(region) LIKE LOWER('%CITY%') LIMIT 5\n"
+        "   Q3 (history): SELECT event_type, year, magnitude_or_category, fatalities, lessons_learned FROM `" + project_id + ".crisis_connect.historical_disasters` "
+        "WHERE LOWER(country) = LOWER('COUNTRY') ORDER BY year DESC LIMIT 5"
     )
 
 situation_analyzer = Agent(
@@ -206,8 +224,8 @@ situation_analyzer = Agent(
         "RULES:\n"
         "- Call ALL tools FIRST. Do NOT output ANY text between tool calls.\n"
         "- After ALL tools return, output exactly ONE compact data block with sections: ALERTS, HISTORY, DEMOGRAPHICS, LESSONS.\n"
-        "- Include ALL GDACS alerts returned (title + severity). If none, say 'None for this area'.\n"
-        "- Max 10 lines total. No prose, no explanations. Raw data only.\n\n"
+        "- GDACS ALERTS: Include ALL alerts returned. If they are global (not local), label them as 'Nearby APAC alerts' for context.\n"
+        "- Max 12 lines total. No prose, no explanations. Raw data only.\n\n"
         "USER QUERY: {user_query}\n"
         "LOCATION: {user_location}\n"
         "CRISIS TYPE: {crisis_type}\n"

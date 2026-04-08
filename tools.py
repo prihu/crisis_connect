@@ -1,8 +1,8 @@
-"""CrisisConnect Tools: BigQuery MCP (Track 2) + Google Maps Direct API.
+"""CrisisConnect Tools: BigQuery via MCP Toolbox (Track 2) + Google Maps Direct API.
 
-BigQuery uses remote MCP server via McpToolset + StreamableHTTPConnectionParams.
-Maps uses direct API calls (remote Maps MCP server is currently unstable).
-Direct BigQuery API is kept as fallback if MCP is unavailable.
+BigQuery uses MCP Toolbox for Databases (github.com/googleapis/genai-toolbox)
+running as a local sidecar server. Handles auth, connection pooling automatically.
+Maps uses direct API calls. Direct BigQuery API is kept as fallback.
 """
 
 import os
@@ -24,32 +24,28 @@ def _get_bq_client():
 
 
 # ============================================================
-# TRACK 2: BigQuery Remote MCP Server
+# TRACK 2: BigQuery via MCP Toolbox for Databases
 # ============================================================
+# MCP Toolbox (github.com/googleapis/genai-toolbox) runs as a local
+# sidecar server on port 5000. It handles auth, connection pooling,
+# and provides prebuilt BigQuery tools (execute_sql, list_tables, etc).
+# No manual OAuth token management needed.
+
+_TOOLBOX_URL = os.getenv("TOOLBOX_URL", "http://127.0.0.1:5000")
+
 
 def get_bigquery_mcp_toolset():
-    """Creates an MCP toolset connected to Google's remote BigQuery MCP server.
+    """Creates an MCP toolset connected to local MCP Toolbox server.
 
-    Uses OAuth 2.0 Bearer token from Application Default Credentials.
-    Returns an McpToolset that provides: list_dataset_ids, get_dataset_info,
-    list_table_ids, get_table_info, execute_sql_readonly, execute_sql.
+    MCP Toolbox handles BigQuery auth via Application Default Credentials.
+    Returns tools: execute_sql, list_tables, get_table_info, etc.
     """
-    import google.auth
-    import google.auth.transport.requests
     from google.adk.tools.mcp_tool.mcp_toolset import McpToolset, StreamableHTTPConnectionParams
 
-    credentials, project_id = google.auth.default(
-        scopes=["https://www.googleapis.com/auth/bigquery"]
-    )
-    credentials.refresh(google.auth.transport.requests.Request())
-
+    logging.info(f"[MCP Toolbox] Connecting to {_TOOLBOX_URL}/mcp")
     return McpToolset(
         connection_params=StreamableHTTPConnectionParams(
-            url="https://bigquery.googleapis.com/mcp",
-            headers={
-                "Authorization": f"Bearer {credentials.token}",
-                "x-goog-user-project": project_id,
-            },
+            url=f"{_TOOLBOX_URL}/mcp",
         )
     )
 
